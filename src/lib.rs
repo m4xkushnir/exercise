@@ -260,6 +260,12 @@ impl Permit {
 
     /// Give the slot back once the query has finished.
     pub fn release(self) {
+        // Drop does the work, so a permit is given back exactly once on every path.
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
         self.pool.release(&self.group, &self.cluster);
     }
 }
