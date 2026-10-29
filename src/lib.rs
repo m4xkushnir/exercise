@@ -76,16 +76,18 @@ impl ClusterState {
     }
 
     fn available(&self) -> u64 {
-        self.max_running() - self.running()
+        // running can sit above max after set_max_running lowers the cap.
+        self.max_running().saturating_sub(self.running())
     }
 
     fn try_increment(&self) -> bool {
-        let current = self.running.load(Ordering::Relaxed);
-        if current >= self.max_running() {
-            return false;
-        }
-        self.running.store(current + 1, Ordering::Relaxed);
-        true
+        // Check and increment in one atomic step. A plain load then store lets two
+        // threads both see room and both get in, and one of the two increments is lost.
+        self.running
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.max_running()).then_some(current + 1)
+            })
+            .is_ok()
     }
 
     fn decrement(&self) {
