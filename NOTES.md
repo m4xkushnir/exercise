@@ -11,13 +11,13 @@
 
 ## Part 2: Performance
 
-Machine (CPU and core count):
+Machine is a MacBook Air with an Intel i5-1030NG7, 4 cores and 8 threads, so the 16 thread bench is oversubscribed 2x.
 
 | Bench | Before | After |
 |-------|--------|-------|
-| acquire_release/1  | | |
-| acquire_release/4  | | |
-| acquire_release/16 | | |
+| acquire_release/1  | 3.53 µs, 284 K/s | |
+| acquire_release/4  | 5.80 µs, 690 K/s | |
+| acquire_release/16 | 16.2 µs, 985 K/s | |
 
 Changes, and why each one helps (or didn't):
 
