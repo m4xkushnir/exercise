@@ -9,13 +9,15 @@ use std::thread;
 use admission::{ClusterConfig, ClusterPool, PoolConfig};
 
 fn pool(clusters: &[(&str, u64)]) -> Arc<ClusterPool> {
-    ClusterPool::new(PoolConfig::default().group(
-        "g",
-        clusters
-            .iter()
-            .map(|(name, max)| ClusterConfig::new(*name, *max))
-            .collect(),
-    ))
+    ClusterPool::new(
+        PoolConfig::default().group(
+            "g",
+            clusters
+                .iter()
+                .map(|(name, max)| ClusterConfig::new(*name, *max))
+                .collect(),
+        ),
+    )
 }
 
 /// INC-1. Many threads race for a small cap. We track how many permits each cluster
@@ -35,7 +37,9 @@ fn inc1_cap_is_never_exceeded_and_counters_return_to_zero() {
             s.spawn(|| {
                 barrier.wait();
                 for _ in 0..ROUNDS {
-                    let Ok(permit) = pool.try_acquire("g") else { continue };
+                    let Ok(permit) = pool.try_acquire("g") else {
+                        continue;
+                    };
                     let slot = &held[(permit.cluster() == "b") as usize];
                     if slot.fetch_add(1, Ordering::SeqCst) + 1 > 3 {
                         over_cap.store(true, Ordering::SeqCst);
@@ -47,10 +51,16 @@ fn inc1_cap_is_never_exceeded_and_counters_return_to_zero() {
         }
     });
 
-    assert!(!over_cap.load(Ordering::SeqCst), "a cluster ran more than max_running");
+    assert!(
+        !over_cap.load(Ordering::SeqCst),
+        "a cluster ran more than max_running"
+    );
     assert_eq!(pool.running("g", "a"), Some(0));
     assert_eq!(pool.running("g", "b"), Some(0));
-    assert!(pool.try_acquire("g").is_ok(), "group is wedged after the spike");
+    assert!(
+        pool.try_acquire("g").is_ok(),
+        "group is wedged after the spike"
+    );
 }
 
 /// INC-2. Cutting the cap below the running count must not panic, and the group must
@@ -62,7 +72,11 @@ fn inc2_lowering_the_cap_while_busy_does_not_panic_or_block_the_group() {
     let mut on_b = Vec::new();
     for _ in 0..80 {
         let p = pool.try_acquire("g").unwrap();
-        if p.cluster() == "a" { on_a.push(p) } else { on_b.push(p) }
+        if p.cluster() == "a" {
+            on_a.push(p)
+        } else {
+            on_b.push(p)
+        }
     }
     pool.set_max_running("g", "a", 10);
 
@@ -106,7 +120,11 @@ fn inc3_no_busy_while_the_group_has_free_slots() {
             });
         }
     });
-    assert_eq!(busy.load(Ordering::Relaxed), 0, "got Busy while slots were free");
+    assert_eq!(
+        busy.load(Ordering::Relaxed),
+        0,
+        "got Busy while slots were free"
+    );
 }
 
 /// INC-4. A client that disconnects drops its permit without calling release.

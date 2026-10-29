@@ -49,7 +49,11 @@ async fn inc5_queries_admitted_during_the_fetch_are_not_wiped() {
 
     assert_eq!(pool.running("g", "a"), Some(3));
     drop(permits);
-    assert_eq!(pool.running("g", "a"), Some(0), "releases after reconcile went below zero");
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(0),
+        "releases after reconcile went below zero"
+    );
 }
 
 #[tokio::test]
@@ -64,7 +68,10 @@ async fn inc5_queries_released_during_the_fetch_are_not_resurrected() {
     task.await.unwrap();
 
     assert_eq!(pool.running("g", "a"), Some(0));
-    assert_eq!(pool.try_acquire("g").map(|p| p.cluster().to_owned()), Ok("a".into()));
+    assert_eq!(
+        pool.try_acquire("g").map(|p| p.cluster().to_owned()),
+        Ok("a".into())
+    );
 }
 
 #[tokio::test]
@@ -131,7 +138,9 @@ fn inc6_cap_holds_while_reloading_under_load() {
             s.spawn(|| {
                 barrier.wait();
                 while !stop.load(Ordering::Relaxed) {
-                    let Ok(permit) = pool.try_acquire("g") else { continue };
+                    let Ok(permit) = pool.try_acquire("g") else {
+                        continue;
+                    };
                     let slot = &held[(permit.cluster() == "b") as usize];
                     if slot.fetch_add(1, Ordering::SeqCst) + 1 > 3 {
                         over_cap.store(true, Ordering::SeqCst);
@@ -154,7 +163,10 @@ fn inc6_cap_holds_while_reloading_under_load() {
         stop.store(true, Ordering::Relaxed);
     });
 
-    assert!(!over_cap.load(Ordering::SeqCst), "a reload let a cluster run over its cap");
+    assert!(
+        !over_cap.load(Ordering::SeqCst),
+        "a reload let a cluster run over its cap"
+    );
     assert_eq!(pool.running("g", "a"), Some(0));
     assert_eq!(pool.running("g", "b"), Some(0));
 }

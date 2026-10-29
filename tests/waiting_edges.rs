@@ -42,7 +42,10 @@ async fn reload_with_more_room_wakes_a_waiter() {
     let waiter = queued_waiter(&pool).await;
 
     pool.reload(config(2));
-    let _permit = waiter.await.unwrap().expect("waiter should get the new slot");
+    let _permit = waiter
+        .await
+        .unwrap()
+        .expect("waiter should get the new slot");
     assert_eq!(pool.running("g", "a"), Some(2));
 }
 
@@ -53,7 +56,10 @@ async fn reload_that_drops_the_group_ends_the_wait() {
     let waiter = queued_waiter(&pool).await;
 
     pool.reload(PoolConfig::default());
-    assert_eq!(waiter.await.unwrap().err(), Some(AcquireError::UnknownGroup));
+    assert_eq!(
+        waiter.await.unwrap().err(),
+        Some(AcquireError::UnknownGroup)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -65,7 +71,11 @@ async fn timeouts_racing_releases_never_strand_a_waiter() {
     let tasks: Vec<_> = (0..200)
         .map(|i| {
             let pool = Arc::clone(&pool);
-            let wait = if i % 2 == 0 { Duration::from_millis(1) } else { Duration::from_secs(10) };
+            let wait = if i % 2 == 0 {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(10)
+            };
             tokio::spawn(async move {
                 match pool.acquire_timeout("g", wait).await {
                     Ok(permit) => {

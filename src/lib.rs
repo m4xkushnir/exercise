@@ -90,7 +90,10 @@ impl ClusterState {
     }
 
     fn running(&self) -> u64 {
-        Self::effective(self.leased.load(Ordering::Relaxed), self.drift.load(Ordering::Relaxed))
+        Self::effective(
+            self.leased.load(Ordering::Relaxed),
+            self.drift.load(Ordering::Relaxed),
+        )
     }
 
     fn effective(leased: u64, drift: i64) -> u64 {
@@ -99,7 +102,9 @@ impl ClusterState {
 
     fn free(&self) -> u64 {
         // running can sit above max after the cap is lowered.
-        self.max_running.load(Ordering::Relaxed).saturating_sub(self.running())
+        self.max_running
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.running())
     }
 
     /// Take a slot if there is one. The cap check and the increment are one atomic step.
