@@ -8,10 +8,13 @@
 //!
 //! See README.md for the tasks.
 
+use std::cell::Cell;
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,19 +54,29 @@ pub enum AcquireError {
     Timeout,
 }
 
+/// Live state of one cluster. A cluster keeps the same state across reloads as long
+/// as its (group, name) stays in the config, so permits, the running count and the
+/// admissions metric all survive a reload.
+///
+/// The counters are hammered by every core, so each cluster gets its own 128 byte
+/// block. Without it two clusters can share a cache line and slow each other down.
 #[derive(Debug)]
+#[repr(align(128))]
 struct ClusterState {
-    name: String,
-    max_running: AtomicU64,
     running: AtomicU64,
+    /// Set to 0 when the cluster leaves the config, so it takes no new queries.
+    max_running: AtomicU64,
+    admissions: AtomicU64,
+    name: String,
 }
 
 impl ClusterState {
-    fn new(config: &ClusterConfig) -> Self {
+    fn new(name: &str) -> Self {
         Self {
-            name: config.name.clone(),
-            max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
+            max_running: AtomicU64::new(0),
+            admissions: AtomicU64::new(0),
+            name: name.to_owned(),
         }
     }
 
@@ -71,115 +84,168 @@ impl ClusterState {
         self.running.load(Ordering::Relaxed)
     }
 
-    fn max_running(&self) -> u64 {
-        self.max_running.load(Ordering::Relaxed)
+    fn free(&self) -> u64 {
+        // running can sit above max after the cap is lowered.
+        self.max_running.load(Ordering::Relaxed).saturating_sub(self.running())
     }
 
-    fn available(&self) -> u64 {
-        // running can sit above max after set_max_running lowers the cap.
-        self.max_running().saturating_sub(self.running())
+    /// Take a slot if there is one. The cap check and the increment are one atomic step.
+    /// Relaxed is enough because the counter guards no other memory. Every
+    /// read-modify-write on one atomic sees the latest value anyway.
+    fn try_lease(&self) -> bool {
+        let mut running = self.running();
+        loop {
+            if running >= self.max_running.load(Ordering::Relaxed) {
+                return false;
+            }
+            match self.running.compare_exchange_weak(
+                running,
+                running + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // Same cache line as running, which this core already owns, so it is cheap.
+                    self.admissions.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(actual) => running = actual,
+            }
+        }
     }
 
-    fn try_increment(&self) -> bool {
-        // Check and increment in one atomic step. A plain load then store lets two
-        // threads both see room and both get in, and one of the two increments is lost.
-        self.running
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < self.max_running()).then_some(current + 1)
+    fn release(&self) {
+        let before = self.running.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before > 0, "released more permits than were taken");
+    }
+}
+
+/// Pick a cluster and take a slot on it.
+///
+/// Power of two choices. Look at two random clusters and take the one with more free
+/// slots. It is close to least loaded but reads two counters instead of all of them,
+/// and threads spread over the clusters instead of all piling onto the same "best"
+/// one. If that cluster fills up first we fall back to a full least loaded scan, and
+/// only report Busy once a scan finds no room at all.
+fn admit(clusters: &[Arc<ClusterState>]) -> Option<&Arc<ClusterState>> {
+    if clusters.len() >= 2 {
+        let (a, b) = two_random(clusters.len());
+        let (a, b) = (&clusters[a], &clusters[b]);
+        let first = if a.free() >= b.free() { a } else { b };
+        if first.try_lease() {
+            return Some(first);
+        }
+    }
+    loop {
+        let (free, best) = clusters
+            .iter()
+            .map(|c| (c.free(), c))
+            .max_by_key(|(free, _)| *free)?;
+        if free == 0 {
+            return None;
+        }
+        if best.try_lease() {
+            return Some(best);
+        }
+    }
+}
+
+/// Two different indices below `n` (n >= 2) from a per thread xorshift generator.
+/// No shared state, so it costs a few instructions and no cache traffic.
+fn two_random(n: usize) -> (usize, usize) {
+    thread_local! {
+        static RNG: Cell<u64> = Cell::new(RandomState::new().hash_one(0u8) | 1);
+    }
+    let r = RNG.with(|rng| {
+        let mut x = rng.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        rng.set(x);
+        x
+    });
+    let a = (r % n as u64) as usize;
+    let b = (a + 1 + ((r >> 32) % (n as u64 - 1)) as usize) % n;
+    (a, b)
+}
+
+struct Group {
+    clusters: Vec<Arc<ClusterState>>,
+}
+
+/// Every cluster ever configured, by (group, name). Only reload and metric reads
+/// touch it, never the hot path.
+#[derive(Default)]
+struct Registry {
+    clusters: HashMap<(String, String), Arc<ClusterState>>,
+}
+
+impl Registry {
+    fn build(&mut self, config: &PoolConfig) -> HashMap<String, Group> {
+        config
+            .groups
+            .iter()
+            .map(|(group, clusters)| {
+                let clusters = clusters
+                    .iter()
+                    .map(|c| {
+                        let state = self
+                            .clusters
+                            .entry((group.clone(), c.name.clone()))
+                            .or_insert_with(|| Arc::new(ClusterState::new(&c.name)));
+                        state.max_running.store(c.max_running, Ordering::Relaxed);
+                        Arc::clone(state)
+                    })
+                    .collect();
+                (group.clone(), Group { clusters })
             })
-            .is_ok()
+            .collect()
     }
-
-    fn decrement(&self) {
-        self.running.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Candidate {
-    name: String,
-    available: u64,
-}
-
-/// Least-loaded selection: the candidate with the most free slots wins.
-fn pick(candidates: &[Candidate]) -> Option<usize> {
-    candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, c)| c.available)
-        .map(|(i, _)| i)
 }
 
 pub struct ClusterPool {
-    groups: RwLock<HashMap<String, Vec<Arc<ClusterState>>>>,
-    admissions: Mutex<HashMap<String, u64>>,
+    groups: RwLock<HashMap<String, Group>>,
+    registry: Mutex<Registry>,
 }
 
 impl ClusterPool {
     pub fn new(config: PoolConfig) -> Arc<Self> {
+        let mut registry = Registry::default();
+        let groups = registry.build(&config);
         Arc::new(Self {
-            groups: RwLock::new(build_groups(&config)),
-            admissions: Mutex::new(HashMap::new()),
+            groups: RwLock::new(groups),
+            registry: Mutex::new(registry),
         })
     }
 
-    fn clusters(&self, group: &str) -> Option<Vec<Arc<ClusterState>>> {
-        self.groups.read().unwrap().get(&group.to_string()).cloned()
+    // Nothing panics while holding these locks, but if it ever did the data is still
+    // consistent (it is all atomics), so carry on instead of taking the gateway down.
+    fn read_groups(&self) -> RwLockReadGuard<'_, HashMap<String, Group>> {
+        self.groups.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn find(&self, group: &str, cluster: &str) -> Option<Arc<ClusterState>> {
-        self.clusters(group)?
-            .into_iter()
+        self.read_groups()
+            .get(group)?
+            .clusters
+            .iter()
             .find(|c| c.name == cluster)
+            .cloned()
     }
 
     /// Admit one query to the least-loaded cluster of `group`, or fail fast with `Busy`.
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
-        let clusters = self.clusters(group).ok_or(AcquireError::UnknownGroup)?;
-
-        let candidates: Vec<Candidate> = clusters
-            .iter()
-            .map(|c| Candidate {
-                name: c.name.clone(),
-                available: c.available(),
-            })
-            .filter(|c| c.available > 0)
-            .collect();
-
-        // Losing the race for the chosen cluster is not Busy. Busy means every cluster
-        // is full, so look again and only give up when a fresh scan finds no room.
-        let mut candidates = candidates;
-        let name = loop {
-            let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
-            let name = candidates[chosen].name.clone();
-            let state = clusters
-                .iter()
-                .find(|c| c.name == name)
-                .ok_or(AcquireError::Busy)?;
-            if state.try_increment() {
-                break name;
-            }
-            candidates = clusters
-                .iter()
-                .map(|c| Candidate {
-                    name: c.name.clone(),
-                    available: c.available(),
-                })
-                .filter(|c| c.available > 0)
-                .collect();
-        };
-
-        *self
-            .admissions
-            .lock()
-            .unwrap()
-            .entry(format!("{group}/{name}"))
-            .or_insert(0) += 1;
-
+        // The read lock is held across the pick so a reload cannot retire a cluster
+        // between the cap check and the increment.
+        let groups = self.read_groups();
+        let group = groups.get(group).ok_or(AcquireError::UnknownGroup)?;
+        let cluster = admit(&group.clusters).ok_or(AcquireError::Busy)?;
         Ok(Permit {
-            pool: Arc::clone(self),
-            group: group.to_string(),
-            cluster: name,
+            cluster: Arc::clone(cluster),
         })
     }
 
@@ -191,12 +257,6 @@ impl ClusterPool {
     ) -> Result<Permit, AcquireError> {
         let _ = (group, wait);
         todo!("Part 3")
-    }
-
-    fn release(&self, group: &str, cluster: &str) {
-        if let Some(state) = self.find(group, cluster) {
-            state.decrement();
-        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -212,12 +272,10 @@ impl ClusterPool {
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
     pub fn admissions(&self, group: &str, cluster: &str) -> u64 {
-        self.admissions
-            .lock()
-            .unwrap()
-            .get(&format!("{group}/{cluster}"))
-            .copied()
-            .unwrap_or(0)
+        self.registry()
+            .clusters
+            .get(&(group.to_owned(), cluster.to_owned()))
+            .map_or(0, |c| c.admissions.load(Ordering::Relaxed))
     }
 
     /// Admin API: change a cluster's capacity at runtime.
@@ -232,7 +290,14 @@ impl ClusterPool {
     /// A cluster keeps its identity across reloads by (group, name). Clusters removed
     /// from the config take no new queries; clusters added to it take traffic at once.
     pub fn reload(&self, config: PoolConfig) {
-        *self.groups.write().unwrap() = build_groups(&config);
+        let mut registry = self.registry();
+        let mut groups = self.groups.write().unwrap_or_else(PoisonError::into_inner);
+        // Retire every current cluster, then build() gives the ones still in the
+        // config their cap back. We hold the write lock, so no caller sees the gap.
+        for cluster in groups.values().flat_map(|g| &g.clusters) {
+            cluster.max_running.store(0, Ordering::Relaxed);
+        }
+        *groups = registry.build(&config);
     }
 
     /// Bonus: correct a cluster's running counter against the engine's own count.
@@ -249,27 +314,18 @@ impl ClusterPool {
     }
 }
 
-fn build_groups(config: &PoolConfig) -> HashMap<String, Vec<Arc<ClusterState>>> {
-    config
-        .groups
-        .iter()
-        .map(|(group, clusters)| {
-            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
-            (group.clone(), states)
-        })
-        .collect()
-}
-
 /// Proof of admission. The holder may run one query on `cluster()`.
+///
+/// It holds the cluster state itself, not a name to look up later, so it always gives
+/// the slot back to the cluster it came from, even if a reload happened in between.
+#[derive(Debug)]
 pub struct Permit {
-    pool: Arc<ClusterPool>,
-    group: String,
-    cluster: String,
+    cluster: Arc<ClusterState>,
 }
 
 impl Permit {
     pub fn cluster(&self) -> &str {
-        &self.cluster
+        &self.cluster.name
     }
 
     /// Give the slot back once the query has finished.
@@ -280,6 +336,6 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.pool.release(&self.group, &self.cluster);
+        self.cluster.release();
     }
 }
