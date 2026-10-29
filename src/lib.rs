@@ -13,9 +13,11 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
@@ -68,15 +70,17 @@ struct ClusterState {
     max_running: AtomicU64,
     admissions: AtomicU64,
     name: String,
+    waiters: Arc<Waiters>,
 }
 
 impl ClusterState {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, waiters: Arc<Waiters>) -> Self {
         Self {
             running: AtomicU64::new(0),
             max_running: AtomicU64::new(0),
             admissions: AtomicU64::new(0),
             name: name.to_owned(),
+            waiters,
         }
     }
 
@@ -115,8 +119,14 @@ impl ClusterState {
     }
 
     fn release(&self) {
-        let before = self.running.fetch_sub(1, Ordering::Relaxed);
+        // SeqCst on both operations pairs with the fence in acquire_timeout. Either the
+        // waiter's retry sees this decrement, or this load sees the waiter. That rules
+        // out a lost wakeup. On x86 both compile to the same instructions as Relaxed.
+        let before = self.running.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(before > 0, "released more permits than were taken");
+        if self.waiters.queued.load(Ordering::SeqCst) > 0 {
+            self.waiters.notify.notify_one();
+        }
     }
 }
 
@@ -169,8 +179,34 @@ fn two_random(n: usize) -> (usize, usize) {
     (a, b)
 }
 
+/// Callers parked in `acquire_timeout` for one group. Shared by the group's clusters
+/// and kept across reloads, like the cluster state.
+#[derive(Debug, Default)]
+struct Waiters {
+    queued: AtomicU64,
+    notify: Notify,
+}
+
+/// Counts a caller as queued for as long as it waits, including when its future is
+/// dropped half way.
+struct Queued<'a>(&'a Waiters);
+
+impl<'a> Queued<'a> {
+    fn enter(waiters: &'a Waiters) -> Self {
+        waiters.queued.fetch_add(1, Ordering::SeqCst);
+        Self(waiters)
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct Group {
     clusters: Vec<Arc<ClusterState>>,
+    waiters: Arc<Waiters>,
 }
 
 /// Every cluster ever configured, by (group, name). Only reload and metric reads
@@ -178,6 +214,7 @@ struct Group {
 #[derive(Default)]
 struct Registry {
     clusters: HashMap<(String, String), Arc<ClusterState>>,
+    waiters: HashMap<String, Arc<Waiters>>,
 }
 
 impl Registry {
@@ -186,18 +223,21 @@ impl Registry {
             .groups
             .iter()
             .map(|(group, clusters)| {
+                let waiters = Arc::clone(self.waiters.entry(group.clone()).or_default());
                 let clusters = clusters
                     .iter()
                     .map(|c| {
                         let state = self
                             .clusters
                             .entry((group.clone(), c.name.clone()))
-                            .or_insert_with(|| Arc::new(ClusterState::new(&c.name)));
+                            .or_insert_with(|| {
+                                Arc::new(ClusterState::new(&c.name, Arc::clone(&waiters)))
+                            });
                         state.max_running.store(c.max_running, Ordering::Relaxed);
                         Arc::clone(state)
                     })
                     .collect();
-                (group.clone(), Group { clusters })
+                (group.clone(), Group { clusters, waiters })
             })
             .collect()
     }
@@ -255,8 +295,38 @@ impl ClusterPool {
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        let _ = (group, wait);
-        todo!("Part 3")
+        let deadline = tokio::time::Instant::now() + wait;
+        let waiters = {
+            let groups = self.read_groups();
+            let g = groups.get(group).ok_or(AcquireError::UnknownGroup)?;
+            if let Some(cluster) = admit(&g.clusters) {
+                return Ok(Permit {
+                    cluster: Arc::clone(cluster),
+                });
+            }
+            Arc::clone(&g.waiters)
+        };
+
+        let _queued = Queued::enter(&waiters);
+        let wait_for_slot = async {
+            loop {
+                // Register for a wakeup before looking at the counters, then look.
+                // A release between the look and the await still wakes us, because
+                // we are already on the list. The fence pairs with release().
+                let notified = waiters.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                fence(Ordering::SeqCst);
+                match self.try_acquire(group) {
+                    Err(AcquireError::Busy) => notified.await,
+                    // A permit, or the group was removed by a reload.
+                    done => return done,
+                }
+            }
+        };
+        tokio::time::timeout_at(deadline, wait_for_slot)
+            .await
+            .unwrap_or(Err(AcquireError::Timeout))
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -266,8 +336,9 @@ impl ClusterPool {
 
     /// Number of callers currently waiting inside `acquire_timeout` for `group`.
     pub fn queued(&self, group: &str) -> u64 {
-        let _ = group;
-        todo!("Part 3")
+        self.read_groups()
+            .get(group)
+            .map_or(0, |g| g.waiters.queued.load(Ordering::Relaxed))
     }
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
@@ -282,6 +353,8 @@ impl ClusterPool {
     pub fn set_max_running(&self, group: &str, cluster: &str, max_running: u64) {
         if let Some(state) = self.find(group, cluster) {
             state.max_running.store(max_running, Ordering::Relaxed);
+            // A raised cap is free room nobody released, so wake the waiters to look.
+            state.waiters.notify.notify_waiters();
         }
     }
 
@@ -298,6 +371,11 @@ impl ClusterPool {
             cluster.max_running.store(0, Ordering::Relaxed);
         }
         *groups = registry.build(&config);
+        drop(groups);
+        // Caps may have grown and groups may be gone. Let every waiter look again.
+        for waiters in registry.waiters.values() {
+            waiters.notify.notify_waiters();
+        }
     }
 
     /// Bonus: correct a cluster's running counter against the engine's own count.
