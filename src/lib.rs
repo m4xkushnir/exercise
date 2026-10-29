@@ -146,16 +146,28 @@ impl ClusterPool {
             .filter(|c| c.available > 0)
             .collect();
 
-        let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
-        let name = candidates[chosen].name.clone();
-        let state = clusters
-            .iter()
-            .find(|c| c.name == name)
-            .ok_or(AcquireError::Busy)?;
-
-        if !state.try_increment() {
-            return Err(AcquireError::Busy);
-        }
+        // Losing the race for the chosen cluster is not Busy. Busy means every cluster
+        // is full, so look again and only give up when a fresh scan finds no room.
+        let mut candidates = candidates;
+        let name = loop {
+            let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
+            let name = candidates[chosen].name.clone();
+            let state = clusters
+                .iter()
+                .find(|c| c.name == name)
+                .ok_or(AcquireError::Busy)?;
+            if state.try_increment() {
+                break name;
+            }
+            candidates = clusters
+                .iter()
+                .map(|c| Candidate {
+                    name: c.name.clone(),
+                    available: c.available(),
+                })
+                .filter(|c| c.available > 0)
+                .collect();
+        };
 
         *self
             .admissions
