@@ -13,7 +13,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::BuildHasher;
-use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
@@ -65,7 +65,11 @@ pub enum AcquireError {
 #[derive(Debug)]
 #[repr(align(128))]
 struct ClusterState {
-    running: AtomicU64,
+    /// Permits handed out and not yet dropped. Only permits move it, so it is exact.
+    leased: AtomicU64,
+    /// What the engine runs beyond our permits (engine count minus leased), as learned
+    /// by reconcile. Kept apart so reconcile never overwrites a counter permits rely on.
+    drift: AtomicI64,
     /// Set to 0 when the cluster leaves the config, so it takes no new queries.
     max_running: AtomicU64,
     admissions: AtomicU64,
@@ -76,7 +80,8 @@ struct ClusterState {
 impl ClusterState {
     fn new(name: &str, waiters: Arc<Waiters>) -> Self {
         Self {
-            running: AtomicU64::new(0),
+            leased: AtomicU64::new(0),
+            drift: AtomicI64::new(0),
             max_running: AtomicU64::new(0),
             admissions: AtomicU64::new(0),
             name: name.to_owned(),
@@ -85,7 +90,11 @@ impl ClusterState {
     }
 
     fn running(&self) -> u64 {
-        self.running.load(Ordering::Relaxed)
+        Self::effective(self.leased.load(Ordering::Relaxed), self.drift.load(Ordering::Relaxed))
+    }
+
+    fn effective(leased: u64, drift: i64) -> u64 {
+        leased.saturating_add_signed(drift)
     }
 
     fn free(&self) -> u64 {
@@ -97,23 +106,24 @@ impl ClusterState {
     /// Relaxed is enough because the counter guards no other memory. Every
     /// read-modify-write on one atomic sees the latest value anyway.
     fn try_lease(&self) -> bool {
-        let mut running = self.running();
+        let mut leased = self.leased.load(Ordering::Relaxed);
         loop {
+            let running = Self::effective(leased, self.drift.load(Ordering::Relaxed));
             if running >= self.max_running.load(Ordering::Relaxed) {
                 return false;
             }
-            match self.running.compare_exchange_weak(
-                running,
-                running + 1,
+            match self.leased.compare_exchange_weak(
+                leased,
+                leased + 1,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // Same cache line as running, which this core already owns, so it is cheap.
+                    // Same cache line as leased, which this core already owns, so it is cheap.
                     self.admissions.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
-                Err(actual) => running = actual,
+                Err(actual) => leased = actual,
             }
         }
     }
@@ -122,11 +132,61 @@ impl ClusterState {
         // SeqCst on both operations pairs with the fence in acquire_timeout. Either the
         // waiter's retry sees this decrement, or this load sees the waiter. That rules
         // out a lost wakeup. On x86 both compile to the same instructions as Relaxed.
-        let before = self.running.fetch_sub(1, Ordering::SeqCst);
+        let before = self.leased.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(before > 0, "released more permits than were taken");
         if self.waiters.queued.load(Ordering::SeqCst) > 0 {
             self.waiters.notify.notify_one();
         }
+    }
+}
+
+/// Counters read together, before and after the slow engine call in reconcile.
+#[derive(Clone, Copy)]
+struct Counts {
+    admitted: u64,
+    leased: u64,
+}
+
+impl ClusterState {
+    fn counts_before(&self) -> Counts {
+        let admitted = self.admissions.load(Ordering::SeqCst);
+        let leased = self.leased.load(Ordering::SeqCst);
+        Counts { admitted, leased }
+    }
+
+    fn counts_after(&self) -> Counts {
+        let leased = self.leased.load(Ordering::SeqCst);
+        let admitted = self.admissions.load(Ordering::SeqCst);
+        Counts { admitted, leased }
+    }
+
+    /// The engine counted its queries at some moment during the fetch. We do not know
+    /// when, but we know how many permits came and went in that time, which bounds what
+    /// `leased` was at that moment and so bounds the real drift. The drift only moves
+    /// as far as it must to land inside those bounds. When nothing moved during the
+    /// fetch the bounds meet and the correction is exact. Under load they are wide and
+    /// we change little, instead of writing a stale number over live counters.
+    ///
+    /// The read order in counts_before and counts_after only ever widens the bounds,
+    /// so a race there makes the correction more cautious, never wrong.
+    fn correct_drift(&self, engine: u64, before: Counts, after: Counts) {
+        let acquired = after.admitted.saturating_sub(before.admitted);
+        let released = (before.leased + acquired).saturating_sub(after.leased);
+        let lowest = before
+            .leased
+            .saturating_sub(released)
+            .max(after.leased.saturating_sub(acquired));
+        let highest = (before.leased + acquired).min(after.leased + released);
+        if lowest > highest {
+            return;
+        }
+        let engine = engine as i64;
+        let (min_drift, max_drift) = (engine - highest as i64, engine - lowest as i64);
+        let _ = self
+            .drift
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |drift| {
+                Some(drift.clamp(min_drift, max_drift))
+            });
     }
 }
 
@@ -351,7 +411,13 @@ impl ClusterPool {
 
     /// Admin API: change a cluster's capacity at runtime.
     pub fn set_max_running(&self, group: &str, cluster: &str, max_running: u64) {
-        if let Some(state) = self.find(group, cluster) {
+        // Store while holding the read lock. Otherwise a reload could run between the
+        // lookup and the store, and this stale store would overwrite the new config.
+        let groups = self.read_groups();
+        let state = groups
+            .get(group)
+            .and_then(|g| g.clusters.iter().find(|c| c.name == cluster));
+        if let Some(state) = state {
             state.max_running.store(max_running, Ordering::Relaxed);
             // A raised cap is free room nobody released, so wake the waiters to look.
             state.waiters.notify.notify_waiters();
@@ -385,10 +451,17 @@ impl ClusterPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = u64>,
     {
-        let target = fetch().await;
-        if let Some(state) = self.find(group, cluster) {
-            state.running.store(target, Ordering::Relaxed);
-        }
+        // Hold the state itself across the await. If a reload lands meanwhile the
+        // cluster keeps its identity, so the correction still goes to the right place.
+        let Some(state) = self.find(group, cluster) else {
+            return;
+        };
+        let before = state.counts_before();
+        let engine = fetch().await;
+        let after = state.counts_after();
+        state.correct_drift(engine, before, after);
+        // A smaller drift is free room nobody released.
+        state.waiters.notify.notify_waiters();
     }
 }
 
